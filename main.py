@@ -1,6 +1,10 @@
+import asyncio
+import contextlib
 import json
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timedelta, timezone, date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional
@@ -21,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("loss-position-screener")
 
-app = FastAPI(title="Loss Position Screener", version="1.0.0")
+app = FastAPI(title="Loss Position Screener", version="1.1.0")
 
 
 HEADERS = [
@@ -59,6 +63,23 @@ MANAGER_TAB_NAME = os.getenv("MANAGER_TAB_NAME", "Manager")
 HISTORY_CALENDAR_DAYS = int(os.getenv("HISTORY_CALENDAR_DAYS", "420"))
 BAR_BATCH_SIZE = int(os.getenv("BAR_BATCH_SIZE", "50"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+
+# Perpetual Railway loop settings.
+# Default: run one Manager refresh, wait 5 minutes after it finishes, then run the next.
+LOOP_ENABLED = os.getenv("LOOP_ENABLED", "true").strip().lower() not in {"false", "0", "no", "off"}
+MIN_LOOP_INTERVAL_SECONDS = max(30, int(os.getenv("MIN_LOOP_INTERVAL_SECONDS", "60")))
+MANAGER_LOOP_INTERVAL_SECONDS = max(
+    MIN_LOOP_INTERVAL_SECONDS,
+    int(os.getenv("MANAGER_LOOP_INTERVAL_SECONDS", os.getenv("LOOP_INTERVAL_SECONDS", "300"))),
+)
+MANAGER_LOOP_INITIAL_DELAY_SECONDS = max(0, int(os.getenv("MANAGER_LOOP_INITIAL_DELAY_SECONDS", "15")))
+
+_refresh_lock = threading.Lock()
+_loop_task: Optional[asyncio.Task] = None
+_last_refresh_started_at: Optional[str] = None
+_last_refresh_finished_at: Optional[str] = None
+_last_refresh_result: Optional[Dict[str, Any]] = None
+_last_refresh_error: Optional[str] = None
 
 
 # -----------------------------
@@ -496,26 +517,140 @@ def build_manager_rows() -> Dict[str, Any]:
     }
 
 
-@app.get("/")
-def root() -> Dict[str, str]:
+def run_manager_refresh(source: str = "manual") -> Dict[str, Any]:
+    """Run exactly one refresh cycle.
+
+    The non-blocking lock prevents the perpetual loop and manual /run calls from
+    overlapping. If a cycle is already running, the caller gets a safe BUSY
+    response instead of starting another Alpaca/Sheets refresh.
+    """
+    global _last_refresh_started_at, _last_refresh_finished_at, _last_refresh_result, _last_refresh_error
+
+    if not _refresh_lock.acquire(blocking=False):
+        return {
+            "status": "busy",
+            "message": "A Manager refresh is already running; no overlapping cycle was started.",
+            "source": source,
+            "last_refresh_started_at": _last_refresh_started_at,
+            "last_refresh_finished_at": _last_refresh_finished_at,
+            "last_refresh_result": _last_refresh_result,
+            "last_refresh_error": _last_refresh_error,
+        }
+
+    _last_refresh_started_at = utc_now_iso()
+    try:
+        logger.info("Starting Manager refresh cycle from %s", source)
+        result = build_manager_rows()
+        result["source"] = source
+        result["loop_enabled"] = LOOP_ENABLED
+        result["next_cycle_after_seconds"] = MANAGER_LOOP_INTERVAL_SECONDS if source == "loop" else None
+        _last_refresh_result = result
+        _last_refresh_error = None
+        logger.info(
+            "Finished Manager refresh from %s: red_positions=%s symbols=%s",
+            source,
+            result.get("red_positions"),
+            result.get("symbols"),
+        )
+        return result
+    except Exception as exc:
+        _last_refresh_error = str(exc)
+        logger.exception("Manager refresh failed from %s", source)
+        raise
+    finally:
+        _last_refresh_finished_at = utc_now_iso()
+        _refresh_lock.release()
+
+
+async def manager_loop() -> None:
+    """Run one refresh after another with a throttle delay after each completed cycle."""
+    if MANAGER_LOOP_INITIAL_DELAY_SECONDS:
+        logger.info("Manager loop initial delay: %s seconds", MANAGER_LOOP_INITIAL_DELAY_SECONDS)
+        await asyncio.sleep(MANAGER_LOOP_INITIAL_DELAY_SECONDS)
+
+    while True:
+        cycle_started = time.monotonic()
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, run_manager_refresh, "loop")
+        except asyncio.CancelledError:
+            logger.info("Manager loop cancelled")
+            raise
+        except Exception:
+            logger.exception("Manager loop cycle failed; continuing after throttle interval")
+
+        elapsed = round(time.monotonic() - cycle_started, 2)
+        logger.info(
+            "Manager loop sleeping for %s seconds after %.2f-second cycle",
+            MANAGER_LOOP_INTERVAL_SECONDS,
+            elapsed,
+        )
+        await asyncio.sleep(MANAGER_LOOP_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def start_manager_loop() -> None:
+    global _loop_task
+    if LOOP_ENABLED:
+        logger.info(
+            "Starting perpetual Manager loop: interval=%s seconds, minimum_interval=%s seconds",
+            MANAGER_LOOP_INTERVAL_SECONDS,
+            MIN_LOOP_INTERVAL_SECONDS,
+        )
+        _loop_task = asyncio.create_task(manager_loop())
+    else:
+        logger.info("Perpetual Manager loop disabled; use /run for manual refreshes")
+
+
+@app.on_event("shutdown")
+async def stop_manager_loop() -> None:
+    global _loop_task
+    if _loop_task is not None:
+        _loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _loop_task
+        _loop_task = None
+
+
+def service_status() -> Dict[str, Any]:
     return {
         "service": "loss-position-screener",
         "status": "running",
+        "loop_enabled": LOOP_ENABLED,
+        "loop_interval_seconds": MANAGER_LOOP_INTERVAL_SECONDS,
+        "minimum_loop_interval_seconds": MIN_LOOP_INTERVAL_SECONDS,
+        "initial_delay_seconds": MANAGER_LOOP_INITIAL_DELAY_SECONDS,
+        "manager_tab": MANAGER_TAB_NAME,
         "run_endpoint": "/run",
+        "status_endpoint": "/status",
+        "last_refresh_started_at": _last_refresh_started_at,
+        "last_refresh_finished_at": _last_refresh_finished_at,
+        "last_refresh_result": _last_refresh_result,
+        "last_refresh_error": _last_refresh_error,
     }
+
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return service_status()
 
 
 @app.get("/health")
 def health() -> Dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "loop_enabled": str(LOOP_ENABLED).lower()}
+
+
+@app.get("/status")
+def status() -> Dict[str, Any]:
+    return service_status()
 
 
 @app.api_route("/run", methods=["GET", "POST"])
 def run() -> Dict[str, Any]:
     try:
-        return build_manager_rows()
+        return run_manager_refresh(source="manual")
     except Exception as exc:
-        logger.exception("Manager refresh failed")
+        logger.exception("Manual Manager refresh failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
