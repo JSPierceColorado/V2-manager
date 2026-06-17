@@ -3,21 +3,23 @@ import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone, date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import gspread
 import pandas as pd
-from fastapi import FastAPI, HTTPException
-from alpaca.trading.client import TradingClient
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed, Adjustment
+from alpaca.trading.client import TradingClient
+from fastapi import FastAPI, HTTPException
 
+APP_VERSION = "1.3.0-option-underlying-metrics"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -25,11 +27,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("loss-position-screener")
 
-app = FastAPI(title="Loss Position Screener", version="1.1.0")
+app = FastAPI(title="Loss Position Screener", version=APP_VERSION)
 
-
+# Columns A:AA intentionally remain compatible with the earlier Manager tab.
+# New option/metric metadata is appended at AB:AE.
 HEADERS = [
-    "symbol",                  # A
+    "symbol",                  # A - actual Alpaca position symbol; downstream bots should act on this
     "side",                    # B
     "asset_class",             # C
     "qty",                     # D
@@ -38,12 +41,12 @@ HEADERS = [
     "market_value",            # G
     "unrealized_pl",           # H
     "unrealized_pct",          # I
-    "daily_close",             # J
-    "sma_200",                 # K
-    "sma_50",                  # L
-    "pos_52w",                 # M
-    "dollar_vol_m",            # N
-    "atr14_pct",               # O
+    "daily_close",             # J - metric symbol daily close
+    "sma_200",                 # K - metric symbol SMA 200
+    "sma_50",                  # L - metric symbol SMA 50
+    "pos_52w",                 # M - metric symbol 52-week position
+    "dollar_vol_m",            # N - metric symbol dollar volume, millions
+    "atr14_pct",               # O - metric symbol ATR14 / metric price
     "current_gt_sma200",       # P
     "sma50_gt_sma200",         # Q
     "first_seen_red_at",       # R
@@ -56,8 +59,11 @@ HEADERS = [
     "reason",                  # Y - Google Sheets formula
     "cooldown_days",           # Z - Google Sheets formula
     "data_status",             # AA
+    "metric_symbol",           # AB - symbol used for market data. For options, this is the underlying.
+    "option_type",             # AC - CALL/PUT/blank
+    "option_expiration",       # AD
+    "option_strike",           # AE
 ]
-
 
 MANAGER_TAB_NAME = os.getenv("MANAGER_TAB_NAME", "Manager")
 HISTORY_CALENDAR_DAYS = int(os.getenv("HISTORY_CALENDAR_DAYS", "420"))
@@ -80,6 +86,7 @@ _last_refresh_started_at: Optional[str] = None
 _last_refresh_finished_at: Optional[str] = None
 _last_refresh_result: Optional[Dict[str, Any]] = None
 _last_refresh_error: Optional[str] = None
+_last_cycle_seconds: Optional[float] = None
 
 
 # -----------------------------
@@ -133,6 +140,86 @@ def bool_or_blank(value: Optional[bool]) -> Any:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+# -----------------------------
+# Position/option symbol helpers
+# -----------------------------
+
+# Alpaca option positions commonly appear as OCC-like compact symbols:
+#   CNI270115C00115000 -> underlying=CNI, expiration=2027-01-15, type=CALL, strike=115.0
+#   CYTK280121C00075000 -> underlying=CYTK, expiration=2028-01-21, type=CALL, strike=75.0
+# This regex is intentionally non-greedy for the underlying so the date is captured reliably.
+OPTION_SYMBOL_RE = re.compile(r"^(.+?)(\d{6})([CP])(\d{8})$")
+
+
+def parse_option_symbol(symbol: str) -> Dict[str, Any]:
+    raw = (symbol or "").strip().upper()
+    match = OPTION_SYMBOL_RE.match(raw)
+    if not match:
+        return {
+            "is_option_symbol": False,
+            "underlying": "",
+            "option_type": "",
+            "expiration": "",
+            "strike": None,
+        }
+
+    underlying, yymmdd, cp, strike_raw = match.groups()
+    try:
+        yy = int(yymmdd[0:2])
+        year = 2000 + yy
+        month = int(yymmdd[2:4])
+        day = int(yymmdd[4:6])
+        expiration = date(year, month, day).isoformat()
+    except ValueError:
+        expiration = ""
+
+    try:
+        strike = int(strike_raw) / 1000.0
+    except ValueError:
+        strike = None
+
+    return {
+        "is_option_symbol": True,
+        "underlying": underlying,
+        "option_type": "CALL" if cp == "C" else "PUT",
+        "expiration": expiration,
+        "strike": strike,
+    }
+
+
+def position_metric_info(symbol: str, asset_class: str) -> Dict[str, Any]:
+    symbol = (symbol or "").strip().upper()
+    asset_class = (asset_class or "").strip().lower()
+
+    parsed = parse_option_symbol(symbol)
+    if asset_class == "us_option" or parsed["is_option_symbol"]:
+        metric_symbol = parsed["underlying"] if parsed["is_option_symbol"] else ""
+        return {
+            "metric_symbol": metric_symbol,
+            "option_type": parsed["option_type"],
+            "option_expiration": parsed["expiration"],
+            "option_strike": parsed["strike"],
+            "is_supported_for_metrics": bool(metric_symbol),
+        }
+
+    if asset_class == "us_equity" or not asset_class:
+        return {
+            "metric_symbol": symbol,
+            "option_type": "",
+            "option_expiration": "",
+            "option_strike": None,
+            "is_supported_for_metrics": bool(symbol),
+        }
+
+    return {
+        "metric_symbol": "",
+        "option_type": "",
+        "option_expiration": "",
+        "option_strike": None,
+        "is_supported_for_metrics": False,
+    }
 
 
 # -----------------------------
@@ -242,13 +329,16 @@ def days_since_iso_date(iso_text: str) -> int:
 
 def row_formulas(row_number: int) -> Dict[str, str]:
     """Formulas are intentionally on the Manager tab only; the Screener tab is never touched."""
+    # Applies to long equities and long calls. Puts and other instruments are left as WATCH.
+    applicable = f'OR($C{row_number}="us_equity",AND($C{row_number}="us_option",$AC{row_number}="CALL"))'
+
     entry_score_now = (
-        f'=IFERROR(IF(OR($B{row_number}<>"long",$C{row_number}<>"us_equity",$AA{row_number}<>"OK"),"",'
+        f'=IFERROR(IF(OR($B{row_number}<>"long",$AA{row_number}<>"OK",NOT({applicable})),"",'
         f'40*$P{row_number}+20*$Q{row_number}+30*$M{row_number}+10*MIN(1,$N{row_number}/10)),"")'
     )
 
     loss_health_score = (
-        f'=IFERROR(IF(OR($B{row_number}<>"long",$C{row_number}<>"us_equity",$AA{row_number}<>"OK"),"",'
+        f'=IFERROR(IF(OR($B{row_number}<>"long",$AA{row_number}<>"OK",NOT({applicable})),"",'
         f'MAX(0,MIN(100,'
         f'35*$P{row_number}+'
         f'15*$Q{row_number}+'
@@ -264,8 +354,8 @@ def row_formulas(row_number: int) -> Dict[str, str]:
 
     action = (
         f'=IFERROR(IF($B{row_number}<>"long","WATCH",'
-        f'IF($C{row_number}<>"us_equity","WATCH",'
         f'IF($AA{row_number}<>"OK","WATCH",'
+        f'IF(NOT({applicable}),"WATCH",'
         f'IF(AND($I{row_number}<0,$P{row_number}=FALSE),"EXIT",'
         f'IF($V{row_number}<50,"EXIT",'
         f'IF($V{row_number}<75,"REDUCE",'
@@ -279,9 +369,10 @@ def row_formulas(row_number: int) -> Dict[str, str]:
 
     reason = (
         f'=IFERROR(IF($B{row_number}<>"long","Short position: long-only formula not applied",'
-        f'IF($C{row_number}<>"us_equity","Non-equity position: stock formula not applied",'
         f'IF($AA{row_number}<>"OK","Data unavailable",'
-        f'IF(AND($I{row_number}<0,$P{row_number}=FALSE),"Lost SMA 200",'
+        f'IF(NOT({applicable}),"Unsupported position type for this formula",'
+        f'IF(AND($I{row_number}<0,$P{row_number}=FALSE),'
+        f'IF($C{row_number}="us_option","Underlying lost SMA 200","Lost SMA 200"),'
         f'IF($V{row_number}<50,"Loss health score below 50",'
         f'IF($V{row_number}<75,"Deteriorating negative position",'
         f'IF($V{row_number}<90,"Negative but structurally alive","Healthy pullback"))))))),"")'
@@ -309,8 +400,9 @@ def write_manager_tab(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
     ws.update(values=rows, range_name="A1", value_input_option="USER_ENTERED")
 
     try:
+        last_col = "AE"
         ws.freeze(rows=1)
-        ws.format("A1:AA1", {"textFormat": {"bold": True}})
+        ws.format(f"A1:{last_col}1", {"textFormat": {"bold": True}})
     except Exception:
         logger.info("Skipping optional worksheet formatting", exc_info=True)
 
@@ -343,7 +435,8 @@ def get_red_positions(trading: TradingClient) -> List[Any]:
 
 
 def fetch_daily_bars(symbols: List[str]) -> pd.DataFrame:
-    if not symbols:
+    clean_symbols = sorted({s.strip().upper() for s in symbols if s and s.strip()})
+    if not clean_symbols:
         return pd.DataFrame()
 
     data_client = alpaca_data_client()
@@ -352,7 +445,8 @@ def fetch_daily_bars(symbols: List[str]) -> pd.DataFrame:
     feed = get_data_feed()
 
     frames: List[pd.DataFrame] = []
-    for batch in chunks(symbols, BAR_BATCH_SIZE):
+    for batch in chunks(clean_symbols, BAR_BATCH_SIZE):
+        logger.info("Fetching daily bars for metric symbols: %s", batch)
         request = StockBarsRequest(
             symbol_or_symbols=batch,
             timeframe=TimeFrame.Day,
@@ -367,7 +461,25 @@ def fetch_daily_bars(symbols: List[str]) -> pd.DataFrame:
             if df is not None and not df.empty:
                 frames.append(df.reset_index())
         except Exception:
-            logger.exception("Failed to fetch daily bars for batch: %s", batch)
+            # If one symbol in a batch is bad, Alpaca rejects the whole request. Try one-by-one so one
+            # invalid metric symbol does not starve the rest of the Manager tab.
+            logger.exception("Failed to fetch daily bars for batch; retrying one-by-one: %s", batch)
+            for symbol in batch:
+                single_request = StockBarsRequest(
+                    symbol_or_symbols=[symbol],
+                    timeframe=TimeFrame.Day,
+                    start=start,
+                    end=end,
+                    feed=feed,
+                    adjustment=Adjustment.RAW,
+                )
+                try:
+                    single_barset = data_client.get_stock_bars(single_request)
+                    single_df = single_barset.df
+                    if single_df is not None and not single_df.empty:
+                        frames.append(single_df.reset_index())
+                except Exception:
+                    logger.exception("Failed to fetch daily bars for metric symbol: %s", symbol)
 
     if not frames:
         return pd.DataFrame()
@@ -379,6 +491,8 @@ def fetch_daily_bars(symbols: List[str]) -> pd.DataFrame:
 
 
 def compute_metrics(symbol: str, bars_df: pd.DataFrame, current_price: Optional[float]) -> Dict[str, Any]:
+    if not symbol:
+        return {"data_status": "NO_METRIC_SYMBOL"}
     if bars_df.empty or "symbol" not in bars_df.columns:
         return {"data_status": "NO_BARS"}
 
@@ -449,8 +563,19 @@ def build_manager_rows() -> Dict[str, Any]:
     existing_first_seen = read_existing_first_seen(ws)
 
     red_positions = get_red_positions(trading)
-    symbols = sorted({as_str(get_field(pos, "symbol")).upper() for pos in red_positions if get_field(pos, "symbol")})
-    bars_df = fetch_daily_bars(symbols)
+
+    position_infos: Dict[str, Dict[str, Any]] = {}
+    metric_symbols: Set[str] = set()
+    for pos in red_positions:
+        symbol = as_str(get_field(pos, "symbol")).upper()
+        asset_class = as_str(get_field(pos, "asset_class"), "").lower()
+        info = position_metric_info(symbol, asset_class)
+        position_infos[symbol] = info
+        if info["is_supported_for_metrics"] and info["metric_symbol"]:
+            metric_symbols.add(info["metric_symbol"])
+
+    symbols = sorted(position_infos.keys())
+    bars_df = fetch_daily_bars(sorted(metric_symbols))
 
     now_iso = utc_now_iso()
     today_first_seen = datetime.now(timezone.utc).date().isoformat()
@@ -470,7 +595,16 @@ def build_manager_rows() -> Dict[str, Any]:
         if unrealized_pct is None and avg_entry and current_price:
             unrealized_pct = (current_price - avg_entry) / avg_entry
 
-        metrics = compute_metrics(symbol, bars_df, current_price)
+        info = position_infos.get(symbol) or position_metric_info(symbol, asset_class)
+        metric_symbol = info["metric_symbol"]
+        option_type = info["option_type"]
+        option_expiration = info["option_expiration"]
+        option_strike = info["option_strike"]
+
+        # For options, the Manager metrics are based on the underlying's latest daily close.
+        # Do not pass the option premium as current_price into an underlying 52-week calculation.
+        metric_current_price = current_price if asset_class == "us_equity" else None
+        metrics = compute_metrics(metric_symbol, bars_df, metric_current_price)
         first_seen = existing_first_seen.get(symbol, today_first_seen)
         formulas = row_formulas(index)
 
@@ -502,6 +636,10 @@ def build_manager_rows() -> Dict[str, Any]:
             formulas["reason"],
             formulas["cooldown_days"],
             metrics.get("data_status", "UNKNOWN"),
+            metric_symbol,
+            option_type,
+            option_expiration,
+            rounded(option_strike, 3),
         ]
         output_rows.append(row)
 
@@ -509,61 +647,60 @@ def build_manager_rows() -> Dict[str, Any]:
 
     return {
         "status": "ok",
+        "app_version": APP_VERSION,
         "manager_tab": MANAGER_TAB_NAME,
         "red_positions": len(red_positions),
         "symbols": symbols,
+        "metric_symbols": sorted(metric_symbols),
         "written_rows_including_header": len(output_rows),
         "refreshed_at": now_iso,
     }
 
 
 def run_manager_refresh(source: str = "manual") -> Dict[str, Any]:
-    """Run exactly one refresh cycle.
+    global _last_refresh_started_at, _last_refresh_finished_at, _last_refresh_result, _last_refresh_error, _last_cycle_seconds
 
-    The non-blocking lock prevents the perpetual loop and manual /run calls from
-    overlapping. If a cycle is already running, the caller gets a safe BUSY
-    response instead of starting another Alpaca/Sheets refresh.
-    """
-    global _last_refresh_started_at, _last_refresh_finished_at, _last_refresh_result, _last_refresh_error
-
-    if not _refresh_lock.acquire(blocking=False):
+    acquired = _refresh_lock.acquire(blocking=False)
+    if not acquired:
         return {
             "status": "busy",
-            "message": "A Manager refresh is already running; no overlapping cycle was started.",
+            "message": "Manager refresh already running; skipped overlapping request.",
             "source": source,
             "last_refresh_started_at": _last_refresh_started_at,
-            "last_refresh_finished_at": _last_refresh_finished_at,
-            "last_refresh_result": _last_refresh_result,
-            "last_refresh_error": _last_refresh_error,
         }
 
+    started = time.monotonic()
     _last_refresh_started_at = utc_now_iso()
+    _last_refresh_error = None
     try:
         logger.info("Starting Manager refresh cycle from %s", source)
         result = build_manager_rows()
+        _last_refresh_result = result
+        _last_refresh_finished_at = utc_now_iso()
+        _last_cycle_seconds = round(time.monotonic() - started, 2)
         result["source"] = source
+        result["cycle_seconds"] = _last_cycle_seconds
         result["loop_enabled"] = LOOP_ENABLED
         result["next_cycle_after_seconds"] = MANAGER_LOOP_INTERVAL_SECONDS if source == "loop" else None
-        _last_refresh_result = result
-        _last_refresh_error = None
         logger.info(
-            "Finished Manager refresh from %s: red_positions=%s symbols=%s",
+            "Finished Manager refresh from %s: red_positions=%s symbols=%s metric_symbols=%s",
             source,
             result.get("red_positions"),
             result.get("symbols"),
+            result.get("metric_symbols"),
         )
         return result
     except Exception as exc:
+        _last_refresh_finished_at = utc_now_iso()
+        _last_cycle_seconds = round(time.monotonic() - started, 2)
         _last_refresh_error = str(exc)
         logger.exception("Manager refresh failed from %s", source)
         raise
     finally:
-        _last_refresh_finished_at = utc_now_iso()
         _refresh_lock.release()
 
 
 async def manager_loop() -> None:
-    """Run one refresh after another with a throttle delay after each completed cycle."""
     if MANAGER_LOOP_INITIAL_DELAY_SECONDS:
         logger.info("Manager loop initial delay: %s seconds", MANAGER_LOOP_INITIAL_DELAY_SECONDS)
         await asyncio.sleep(MANAGER_LOOP_INITIAL_DELAY_SECONDS)
@@ -579,11 +716,11 @@ async def manager_loop() -> None:
         except Exception:
             logger.exception("Manager loop cycle failed; continuing after throttle interval")
 
-        elapsed = round(time.monotonic() - cycle_started, 2)
+        cycle_seconds = time.monotonic() - cycle_started
         logger.info(
             "Manager loop sleeping for %s seconds after %.2f-second cycle",
             MANAGER_LOOP_INTERVAL_SECONDS,
-            elapsed,
+            cycle_seconds,
         )
         await asyncio.sleep(MANAGER_LOOP_INTERVAL_SECONDS)
 
@@ -591,6 +728,14 @@ async def manager_loop() -> None:
 @app.on_event("startup")
 async def start_manager_loop() -> None:
     global _loop_task
+    logger.warning(
+        "Loaded Loss Position Screener version=%s loop_enabled=%s interval=%s initial_delay=%s manager_tab=%s",
+        APP_VERSION,
+        LOOP_ENABLED,
+        MANAGER_LOOP_INTERVAL_SECONDS,
+        MANAGER_LOOP_INITIAL_DELAY_SECONDS,
+        MANAGER_TAB_NAME,
+    )
     if LOOP_ENABLED:
         logger.info(
             "Starting perpetual Manager loop: interval=%s seconds, minimum_interval=%s seconds",
@@ -612,45 +757,50 @@ async def stop_manager_loop() -> None:
         _loop_task = None
 
 
-def service_status() -> Dict[str, Any]:
+@app.get("/")
+def root() -> Dict[str, Any]:
     return {
         "service": "loss-position-screener",
         "status": "running",
+        "app_version": APP_VERSION,
+        "manager_tab": MANAGER_TAB_NAME,
         "loop_enabled": LOOP_ENABLED,
         "loop_interval_seconds": MANAGER_LOOP_INTERVAL_SECONDS,
         "minimum_loop_interval_seconds": MIN_LOOP_INTERVAL_SECONDS,
-        "initial_delay_seconds": MANAGER_LOOP_INITIAL_DELAY_SECONDS,
-        "manager_tab": MANAGER_TAB_NAME,
+        "loop_initial_delay_seconds": MANAGER_LOOP_INITIAL_DELAY_SECONDS,
         "run_endpoint": "/run",
         "status_endpoint": "/status",
+    }
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"status": "ok", "app_version": APP_VERSION, "loop_enabled": LOOP_ENABLED}
+
+
+@app.get("/status")
+def status() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "app_version": APP_VERSION,
+        "manager_tab": MANAGER_TAB_NAME,
+        "loop_enabled": LOOP_ENABLED,
+        "loop_interval_seconds": MANAGER_LOOP_INTERVAL_SECONDS,
+        "loop_initial_delay_seconds": MANAGER_LOOP_INITIAL_DELAY_SECONDS,
+        "refresh_in_progress": _refresh_lock.locked(),
         "last_refresh_started_at": _last_refresh_started_at,
         "last_refresh_finished_at": _last_refresh_finished_at,
+        "last_cycle_seconds": _last_cycle_seconds,
         "last_refresh_result": _last_refresh_result,
         "last_refresh_error": _last_refresh_error,
     }
 
 
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return service_status()
-
-
-@app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok", "loop_enabled": str(LOOP_ENABLED).lower()}
-
-
-@app.get("/status")
-def status() -> Dict[str, Any]:
-    return service_status()
-
-
 @app.api_route("/run", methods=["GET", "POST"])
 def run() -> Dict[str, Any]:
     try:
-        return run_manager_refresh(source="manual")
+        return run_manager_refresh("manual")
     except Exception as exc:
-        logger.exception("Manual Manager refresh failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
