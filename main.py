@@ -9,6 +9,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo
 
 import gspread
 import pandas as pd
@@ -19,7 +20,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from fastapi import FastAPI, HTTPException
 
-APP_VERSION = "1.3.0-option-underlying-metrics"
+APP_VERSION = "1.4.0-confirmed-loss-actions"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -30,7 +31,8 @@ logger = logging.getLogger("loss-position-screener")
 app = FastAPI(title="Loss Position Screener", version=APP_VERSION)
 
 # Columns A:AA intentionally remain compatible with the earlier Manager tab.
-# New option/metric metadata is appended at AB:AE.
+# New option/metric metadata is appended after AA so the established columns
+# consumed by the Executor never move.
 HEADERS = [
     "symbol",                  # A - actual Alpaca position symbol; downstream bots should act on this
     "side",                    # B
@@ -63,12 +65,21 @@ HEADERS = [
     "option_type",             # AC - CALL/PUT/blank
     "option_expiration",       # AD
     "option_strike",           # AE
+    "sma200_below_days",       # AF - consecutive completed closes below SMA 200
+    "completed_bar_date",      # AG - latest completed market session used for metrics
 ]
 
 MANAGER_TAB_NAME = os.getenv("MANAGER_TAB_NAME", "Manager")
 HISTORY_CALENDAR_DAYS = int(os.getenv("HISTORY_CALENDAR_DAYS", "420"))
 BAR_BATCH_SIZE = int(os.getenv("BAR_BATCH_SIZE", "50"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+
+# Technical signals use completed daily bars only. These environment variables
+# make the loss policy adjustable without changing the sheet contract.
+SMA200_CONFIRMATION_DAYS = max(2, int(os.getenv("SMA200_CONFIRMATION_DAYS", "2")))
+FULL_EXIT_MIN_LOSS_PCT = -abs(float(os.getenv("FULL_EXIT_MIN_LOSS_PCT", "0.08")))
+FULL_EXIT_MIN_DAYS_RED = max(1, int(os.getenv("FULL_EXIT_MIN_DAYS_RED", "5")))
 
 # Perpetual Railway loop settings.
 # Default: run one Manager refresh, wait 5 minutes after it finishes, then run the next.
@@ -328,9 +339,14 @@ def days_since_iso_date(iso_text: str) -> int:
 
 
 def row_formulas(row_number: int) -> Dict[str, str]:
-    """Formulas are intentionally on the Manager tab only; the Screener tab is never touched."""
+    """Build Manager formulas without moving the Executor's A:AA contract."""
     # Applies to long equities and long calls. Puts and other instruments are left as WATCH.
     applicable = f'OR($C{row_number}="us_equity",AND($C{row_number}="us_option",$AC{row_number}="CALL"))'
+    confirmed_sma_break = f'$AF{row_number}>={SMA200_CONFIRMATION_DAYS}'
+    severe_persistent_loss = (
+        f'AND($I{row_number}<={FULL_EXIT_MIN_LOSS_PCT:.6f},'
+        f'$V{row_number}<50,{confirmed_sma_break},$S{row_number}>={FULL_EXIT_MIN_DAYS_RED})'
+    )
 
     entry_score_now = (
         f'=IFERROR(IF(OR($B{row_number}<>"long",$AA{row_number}<>"OK",NOT({applicable})),"",'
@@ -356,30 +372,27 @@ def row_formulas(row_number: int) -> Dict[str, str]:
         f'=IFERROR(IF($B{row_number}<>"long","WATCH",'
         f'IF($AA{row_number}<>"OK","WATCH",'
         f'IF(NOT({applicable}),"WATCH",'
-        f'IF(AND($I{row_number}<0,$P{row_number}=FALSE),"EXIT",'
-        f'IF($V{row_number}<50,"EXIT",'
-        f'IF($V{row_number}<75,"REDUCE",'
-        f'IF($V{row_number}<90,"WATCH","HOLD"))))))),"")'
+        f'IF({severe_persistent_loss},"EXIT",'
+        f'IF(AND($I{row_number}<0,{confirmed_sma_break}),"REDUCE",'
+        f'IF($V{row_number}<90,"WATCH","HOLD")))))),"")'
     )
 
     reduce_pct = (
         f'=IFERROR(IF($W{row_number}="EXIT",100,'
-        f'IF($W{row_number}="REDUCE",IF($V{row_number}<60,50,25),0)),"")'
+        f'IF($W{row_number}="REDUCE",25,0)),"")'
     )
 
     reason = (
         f'=IFERROR(IF($B{row_number}<>"long","Short position: long-only formula not applied",'
         f'IF($AA{row_number}<>"OK","Data unavailable",'
         f'IF(NOT({applicable}),"Unsupported position type for this formula",'
-        f'IF(AND($I{row_number}<0,$P{row_number}=FALSE),'
-        f'IF($C{row_number}="us_option","Underlying lost SMA 200","Lost SMA 200"),'
-        f'IF($V{row_number}<50,"Loss health score below 50",'
-        f'IF($V{row_number}<75,"Deteriorating negative position",'
-        f'IF($V{row_number}<90,"Negative but structurally alive","Healthy pullback"))))))),"")'
+        f'IF({severe_persistent_loss},"Severe persistent loss after confirmed SMA 200 break",'
+        f'IF(AND($I{row_number}<0,{confirmed_sma_break}),"Confirmed SMA 200 break: reduce 25%",'
+        f'IF($V{row_number}<90,"Negative but awaiting confirmed SMA 200 break","Healthy pullback")))))),"")'
     )
 
     cooldown_days = (
-        f'=IFERROR(IF($W{row_number}="EXIT",IF($I{row_number}<=-0.08,10,5),'
+        f'=IFERROR(IF($W{row_number}="EXIT",10,'
         f'IF($W{row_number}="REDUCE",3,0)),"")'
     )
 
@@ -400,7 +413,7 @@ def write_manager_tab(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
     ws.update(values=rows, range_name="A1", value_input_option="USER_ENTERED")
 
     try:
-        last_col = "AE"
+        last_col = "AG"
         ws.freeze(rows=1)
         ws.format(f"A1:{last_col}1", {"textFormat": {"bold": True}})
     except Exception:
@@ -506,15 +519,41 @@ def compute_metrics(symbol: str, bars_df: pd.DataFrame, current_price: Optional[
     if df.empty:
         return {"data_status": "BAD_BARS"}
 
-    if "timestamp" in df.columns:
-        df = df.sort_values("timestamp")
+    if "timestamp" not in df.columns:
+        return {"data_status": "NO_TIMESTAMPS"}
+
+    timestamps = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df = df.loc[timestamps.notna()].copy()
+    if df.empty:
+        return {"data_status": "BAD_TIMESTAMPS"}
+
+    timestamps = timestamps.loc[df.index]
+    df["_market_date"] = timestamps.dt.tz_convert(MARKET_TIMEZONE).dt.date
+    current_market_time = datetime.now(MARKET_TIMEZONE)
+    current_market_date = current_market_time.date()
+    after_close_buffer = (current_market_time.hour, current_market_time.minute) >= (16, 15)
+    completed_mask = (
+        df["_market_date"] <= current_market_date
+        if after_close_buffer
+        else df["_market_date"] < current_market_date
+    )
+    df = df[completed_mask].sort_values("timestamp")
+    if df.empty:
+        return {"data_status": "NO_COMPLETED_BARS"}
 
     close_series = df["close"]
     latest_close = float(close_series.iloc[-1])
-    effective_price = current_price if current_price is not None and current_price > 0 else latest_close
+    effective_price = latest_close
 
     sma_50 = float(close_series.tail(min(50, len(close_series))).mean())
     sma_200 = float(close_series.tail(min(200, len(close_series))).mean())
+    rolling_sma_200 = close_series.rolling(window=200, min_periods=1).mean()
+    below_sma_200 = close_series < rolling_sma_200
+    sma200_below_days = 0
+    for is_below in reversed(below_sma_200.tolist()):
+        if not bool(is_below):
+            break
+        sma200_below_days += 1
 
     lookback_52w = df.tail(min(252, len(df)))
     low_52w = float(lookback_52w["low"].min())
@@ -546,8 +585,10 @@ def compute_metrics(symbol: str, bars_df: pd.DataFrame, current_price: Optional[
         "pos_52w": pos_52w,
         "dollar_vol_m": dollar_vol_m,
         "atr14_pct": atr14_pct,
-        "current_gt_sma200": effective_price > sma_200 if sma_200 else None,
+        "current_gt_sma200": latest_close > sma_200 if sma_200 else None,
         "sma50_gt_sma200": sma_50 > sma_200 if sma_50 and sma_200 else None,
+        "sma200_below_days": sma200_below_days,
+        "completed_bar_date": df["_market_date"].iloc[-1].isoformat(),
         "data_status": "OK",
     }
 
@@ -640,6 +681,8 @@ def build_manager_rows() -> Dict[str, Any]:
             option_type,
             option_expiration,
             rounded(option_strike, 3),
+            metrics.get("sma200_below_days", ""),
+            metrics.get("completed_bar_date", ""),
         ]
         output_rows.append(row)
 
@@ -649,6 +692,13 @@ def build_manager_rows() -> Dict[str, Any]:
         "status": "ok",
         "app_version": APP_VERSION,
         "manager_tab": MANAGER_TAB_NAME,
+        "loss_policy": {
+            "completed_daily_bars_only": True,
+            "sma200_confirmation_days": SMA200_CONFIRMATION_DAYS,
+            "reduce_pct": 25,
+            "full_exit_min_loss_pct": FULL_EXIT_MIN_LOSS_PCT,
+            "full_exit_min_days_red": FULL_EXIT_MIN_DAYS_RED,
+        },
         "red_positions": len(red_positions),
         "symbols": symbols,
         "metric_symbols": sorted(metric_symbols),
@@ -764,6 +814,13 @@ def root() -> Dict[str, Any]:
         "status": "running",
         "app_version": APP_VERSION,
         "manager_tab": MANAGER_TAB_NAME,
+        "loss_policy": {
+            "completed_daily_bars_only": True,
+            "sma200_confirmation_days": SMA200_CONFIRMATION_DAYS,
+            "reduce_pct": 25,
+            "full_exit_min_loss_pct": FULL_EXIT_MIN_LOSS_PCT,
+            "full_exit_min_days_red": FULL_EXIT_MIN_DAYS_RED,
+        },
         "loop_enabled": LOOP_ENABLED,
         "loop_interval_seconds": MANAGER_LOOP_INTERVAL_SECONDS,
         "minimum_loop_interval_seconds": MIN_LOOP_INTERVAL_SECONDS,
