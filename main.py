@@ -20,7 +20,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from fastapi import FastAPI, HTTPException
 
-APP_VERSION = "1.4.0-confirmed-loss-actions"
+APP_VERSION = "1.5.0-profit-protect-loss-policy"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -77,9 +77,22 @@ MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 # Technical signals use completed daily bars only. These environment variables
 # make the loss policy adjustable without changing the sheet contract.
+#
+# The previous policy waited for a confirmed SMA 200 break before most loss actions.
+# This version adds earlier, staged loss controls so small losses are reduced before
+# they become portfolio-level drag.
 SMA200_CONFIRMATION_DAYS = max(2, int(os.getenv("SMA200_CONFIRMATION_DAYS", "2")))
-FULL_EXIT_MIN_LOSS_PCT = -abs(float(os.getenv("FULL_EXIT_MIN_LOSS_PCT", "0.08")))
-FULL_EXIT_MIN_DAYS_RED = max(1, int(os.getenv("FULL_EXIT_MIN_DAYS_RED", "5")))
+REDUCE_LOSS_PCT = -abs(float(os.getenv("REDUCE_LOSS_PCT", "0.05")))
+HEAVY_REDUCE_LOSS_PCT = -abs(float(os.getenv("HEAVY_REDUCE_LOSS_PCT", "0.08")))
+EXIT_LOSS_PCT = -abs(float(os.getenv("EXIT_LOSS_PCT", "0.12")))
+REDUCE_DAYS_RED = max(1, int(os.getenv("REDUCE_DAYS_RED", "5")))
+EXIT_DAYS_RED = max(1, int(os.getenv("EXIT_DAYS_RED", "15")))
+ATR_REDUCE_MULTIPLE = abs(float(os.getenv("ATR_REDUCE_MULTIPLE", "2.0")))
+ATR_EXIT_MULTIPLE = abs(float(os.getenv("ATR_EXIT_MULTIPLE", "3.0")))
+WEAK_HEALTH_REDUCE_SCORE = max(0, min(100, int(os.getenv("WEAK_HEALTH_REDUCE_SCORE", "75"))))
+WEAK_HEALTH_EXIT_SCORE = max(0, min(100, int(os.getenv("WEAK_HEALTH_EXIT_SCORE", "45"))))
+STANDARD_REDUCE_PCT = max(1, min(99, int(os.getenv("STANDARD_REDUCE_PCT", "25"))))
+HEAVY_REDUCE_PCT = max(STANDARD_REDUCE_PCT, min(99, int(os.getenv("HEAVY_REDUCE_PCT", "50"))))
 
 # Perpetual Railway loop settings.
 # Default: run one Manager refresh, wait 5 minutes after it finishes, then run the next.
@@ -151,6 +164,24 @@ def bool_or_blank(value: Optional[bool]) -> Any:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def loss_policy_config() -> Dict[str, Any]:
+    return {
+        "completed_daily_bars_only": True,
+        "sma200_confirmation_days": SMA200_CONFIRMATION_DAYS,
+        "standard_reduce_pct": STANDARD_REDUCE_PCT,
+        "heavy_reduce_pct": HEAVY_REDUCE_PCT,
+        "reduce_loss_pct": REDUCE_LOSS_PCT,
+        "heavy_reduce_loss_pct": HEAVY_REDUCE_LOSS_PCT,
+        "exit_loss_pct": EXIT_LOSS_PCT,
+        "reduce_days_red": REDUCE_DAYS_RED,
+        "exit_days_red": EXIT_DAYS_RED,
+        "atr_reduce_multiple": ATR_REDUCE_MULTIPLE,
+        "atr_exit_multiple": ATR_EXIT_MULTIPLE,
+        "weak_health_reduce_score": WEAK_HEALTH_REDUCE_SCORE,
+        "weak_health_exit_score": WEAK_HEALTH_EXIT_SCORE,
+    }
 
 
 # -----------------------------
@@ -343,10 +374,55 @@ def row_formulas(row_number: int) -> Dict[str, str]:
     # Applies to long equities and long calls. Puts and other instruments are left as WATCH.
     applicable = f'OR($C{row_number}="us_equity",AND($C{row_number}="us_option",$AC{row_number}="CALL"))'
     confirmed_sma_break = f'$AF{row_number}>={SMA200_CONFIRMATION_DAYS}'
-    severe_persistent_loss = (
-        f'AND($I{row_number}<={FULL_EXIT_MIN_LOSS_PCT:.6f},'
-        f'$V{row_number}<50,{confirmed_sma_break},$S{row_number}>={FULL_EXIT_MIN_DAYS_RED})'
+
+    # Loss controls intentionally trigger before a 200-day SMA break. The SMA200 rule is
+    # still retained as a trend-failure signal, but it is no longer the first line of defense.
+    hard_loss_exit = f'$I{row_number}<={EXIT_LOSS_PCT:.6f}'
+    atr_exit = (
+        f'AND($O{row_number}<>"",$O{row_number}>0,'
+        f'$I{row_number}<=-{ATR_EXIT_MULTIPLE:.6f}*$O{row_number})'
     )
+    persistent_weak_exit = (
+        f'AND($S{row_number}>={EXIT_DAYS_RED},'
+        f'$I{row_number}<={HEAVY_REDUCE_LOSS_PCT:.6f},'
+        f'$V{row_number}<={WEAK_HEALTH_REDUCE_SCORE})'
+    )
+    failed_trend_exit = (
+        f'AND({confirmed_sma_break},$I{row_number}<={REDUCE_LOSS_PCT:.6f},'
+        f'$V{row_number}<={WEAK_HEALTH_REDUCE_SCORE})'
+    )
+    broken_health_exit = (
+        f'AND($S{row_number}>={EXIT_DAYS_RED},'
+        f'$I{row_number}<={REDUCE_LOSS_PCT:.6f},'
+        f'$V{row_number}<={WEAK_HEALTH_EXIT_SCORE})'
+    )
+    exit_signal = (
+        f'OR({hard_loss_exit},{atr_exit},{persistent_weak_exit},'
+        f'{failed_trend_exit},{broken_health_exit})'
+    )
+
+    heavy_loss_reduce = f'$I{row_number}<={HEAVY_REDUCE_LOSS_PCT:.6f}'
+    atr_reduce = (
+        f'AND($O{row_number}<>"",$O{row_number}>0,'
+        f'$I{row_number}<=-{ATR_REDUCE_MULTIPLE:.6f}*$O{row_number})'
+    )
+    sma50_break_reduce = (
+        f'AND($J{row_number}<>"",$L{row_number}<>"",'
+        f'$J{row_number}<$L{row_number},$I{row_number}<=-0.040000)'
+    )
+    persistent_loss_reduce = (
+        f'AND($S{row_number}>={REDUCE_DAYS_RED},'
+        f'$I{row_number}<={REDUCE_LOSS_PCT:.6f})'
+    )
+    weak_health_reduce = (
+        f'AND($I{row_number}<0,$V{row_number}<={WEAK_HEALTH_REDUCE_SCORE})'
+    )
+    trend_break_reduce = f'AND($I{row_number}<0,{confirmed_sma_break})'
+    reduce_signal = (
+        f'OR({heavy_loss_reduce},{atr_reduce},{sma50_break_reduce},'
+        f'{persistent_loss_reduce},{weak_health_reduce},{trend_break_reduce})'
+    )
+    heavy_reduce_signal = f'OR({heavy_loss_reduce},{atr_reduce},{sma50_break_reduce})'
 
     entry_score_now = (
         f'=IFERROR(IF(OR($B{row_number}<>"long",$AA{row_number}<>"OK",NOT({applicable})),"",'
@@ -356,15 +432,22 @@ def row_formulas(row_number: int) -> Dict[str, str]:
     loss_health_score = (
         f'=IFERROR(IF(OR($B{row_number}<>"long",$AA{row_number}<>"OK",NOT({applicable})),"",'
         f'MAX(0,MIN(100,'
-        f'35*$P{row_number}+'
+        f'25*$P{row_number}+'
         f'15*$Q{row_number}+'
         f'20*$M{row_number}+'
-        f'20*MIN(1,$N{row_number}/10)+'
-        f'10*($I{row_number}>-0.03)-'
-        f'10*($I{row_number}<=-0.05)-'
+        f'15*MIN(1,$N{row_number}/10)+'
+        f'10*($I{row_number}>-0.03)+'
+        f'5*($J{row_number}>=$L{row_number})-'
+        f'10*($I{row_number}<=-0.03)-'
+        f'15*($I{row_number}<=-0.05)-'
         f'20*($I{row_number}<=-0.08)-'
-        f'10*($S{row_number}>=10)-'
-        f'20*($S{row_number}>=20)'
+        f'25*($I{row_number}<=-0.12)-'
+        f'10*($S{row_number}>={REDUCE_DAYS_RED})-'
+        f'15*($S{row_number}>=10)-'
+        f'15*($S{row_number}>={EXIT_DAYS_RED})-'
+        f'15*($J{row_number}<$L{row_number})-'
+        f'25*($J{row_number}<$K{row_number})-'
+        f'10*AND($O{row_number}<>"",$O{row_number}>0,$I{row_number}<=-{ATR_REDUCE_MULTIPLE:.6f}*$O{row_number})'
         f'))),"")'
     )
 
@@ -372,23 +455,33 @@ def row_formulas(row_number: int) -> Dict[str, str]:
         f'=IFERROR(IF($B{row_number}<>"long","WATCH",'
         f'IF($AA{row_number}<>"OK","WATCH",'
         f'IF(NOT({applicable}),"WATCH",'
-        f'IF({severe_persistent_loss},"EXIT",'
-        f'IF(AND($I{row_number}<0,{confirmed_sma_break}),"REDUCE",'
+        f'IF({exit_signal},"EXIT",'
+        f'IF({reduce_signal},"REDUCE",'
         f'IF($V{row_number}<90,"WATCH","HOLD")))))),"")'
     )
 
     reduce_pct = (
         f'=IFERROR(IF($W{row_number}="EXIT",100,'
-        f'IF($W{row_number}="REDUCE",25,0)),"")'
+        f'IF($W{row_number}="REDUCE",'
+        f'IF({heavy_reduce_signal},{HEAVY_REDUCE_PCT},{STANDARD_REDUCE_PCT}),0)),"")'
     )
 
     reason = (
         f'=IFERROR(IF($B{row_number}<>"long","Short position: long-only formula not applied",'
         f'IF($AA{row_number}<>"OK","Data unavailable",'
         f'IF(NOT({applicable}),"Unsupported position type for this formula",'
-        f'IF({severe_persistent_loss},"Severe persistent loss after confirmed SMA 200 break",'
-        f'IF(AND($I{row_number}<0,{confirmed_sma_break}),"Confirmed SMA 200 break: reduce 25%",'
-        f'IF($V{row_number}<90,"Negative but awaiting confirmed SMA 200 break","Healthy pullback")))))),"")'
+        f'IF({hard_loss_exit},"Hard loss stop: exit",'
+        f'IF({atr_exit},"ATR damage stop: exit",'
+        f'IF({persistent_weak_exit},"Persistent weak loser: exit",'
+        f'IF({failed_trend_exit},"Confirmed SMA 200 break plus weak loss: exit",'
+        f'IF({broken_health_exit},"Low loss-health score after extended red period: exit",'
+        f'IF({heavy_loss_reduce},"Loss reached heavy-reduce threshold",'
+        f'IF({atr_reduce},"Loss exceeds ATR risk budget: reduce",'
+        f'IF({sma50_break_reduce},"SMA 50 break while red: reduce",'
+        f'IF({persistent_loss_reduce},"Loss persisted past time stop: reduce",'
+        f'IF({weak_health_reduce},"Weak loss-health score: reduce",'
+        f'IF({trend_break_reduce},"Confirmed SMA 200 break: reduce",'
+        f'IF($V{row_number}<90,"Negative but risk still inside limits","Healthy pullback"))))))))))))))),"")'
     )
 
     cooldown_days = (
@@ -692,13 +785,7 @@ def build_manager_rows() -> Dict[str, Any]:
         "status": "ok",
         "app_version": APP_VERSION,
         "manager_tab": MANAGER_TAB_NAME,
-        "loss_policy": {
-            "completed_daily_bars_only": True,
-            "sma200_confirmation_days": SMA200_CONFIRMATION_DAYS,
-            "reduce_pct": 25,
-            "full_exit_min_loss_pct": FULL_EXIT_MIN_LOSS_PCT,
-            "full_exit_min_days_red": FULL_EXIT_MIN_DAYS_RED,
-        },
+        "loss_policy": loss_policy_config(),
         "red_positions": len(red_positions),
         "symbols": symbols,
         "metric_symbols": sorted(metric_symbols),
@@ -814,13 +901,7 @@ def root() -> Dict[str, Any]:
         "status": "running",
         "app_version": APP_VERSION,
         "manager_tab": MANAGER_TAB_NAME,
-        "loss_policy": {
-            "completed_daily_bars_only": True,
-            "sma200_confirmation_days": SMA200_CONFIRMATION_DAYS,
-            "reduce_pct": 25,
-            "full_exit_min_loss_pct": FULL_EXIT_MIN_LOSS_PCT,
-            "full_exit_min_days_red": FULL_EXIT_MIN_DAYS_RED,
-        },
+        "loss_policy": loss_policy_config(),
         "loop_enabled": LOOP_ENABLED,
         "loop_interval_seconds": MANAGER_LOOP_INTERVAL_SECONDS,
         "minimum_loop_interval_seconds": MIN_LOOP_INTERVAL_SECONDS,
