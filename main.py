@@ -20,7 +20,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from fastapi import FastAPI, HTTPException
 
-APP_VERSION = "1.5.0-profit-protect-loss-policy"
+APP_VERSION = "1.6.0-sma50-extension-reduction"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -93,6 +93,16 @@ WEAK_HEALTH_REDUCE_SCORE = max(0, min(100, int(os.getenv("WEAK_HEALTH_REDUCE_SCO
 WEAK_HEALTH_EXIT_SCORE = max(0, min(100, int(os.getenv("WEAK_HEALTH_EXIT_SCORE", "45"))))
 STANDARD_REDUCE_PCT = max(1, min(99, int(os.getenv("STANDARD_REDUCE_PCT", "25"))))
 HEAVY_REDUCE_PCT = max(STANDARD_REDUCE_PCT, min(99, int(os.getenv("HEAVY_REDUCE_PCT", "50"))))
+
+# Extension controls: these do not force skips or exits. They make already-red positions
+# reduce more aggressively when the completed daily close remains stretched above SMA 50.
+SMA50_EXTENSION_REDUCE_DISTANCE = abs(float(os.getenv("SMA50_EXTENSION_REDUCE_DISTANCE", "0.15")))
+SMA50_EXTENSION_HEAVY_DISTANCE = max(
+    SMA50_EXTENSION_REDUCE_DISTANCE,
+    abs(float(os.getenv("SMA50_EXTENSION_HEAVY_DISTANCE", "0.30"))),
+)
+SMA50_EXTENSION_MIN_LOSS_PCT = -abs(float(os.getenv("SMA50_EXTENSION_MIN_LOSS_PCT", "0.02")))
+EXTENSION_REDUCE_PCT = max(HEAVY_REDUCE_PCT, min(99, int(os.getenv("EXTENSION_REDUCE_PCT", "75"))))
 
 # Perpetual Railway loop settings.
 # Default: run one Manager refresh, wait 5 minutes after it finishes, then run the next.
@@ -181,6 +191,10 @@ def loss_policy_config() -> Dict[str, Any]:
         "atr_exit_multiple": ATR_EXIT_MULTIPLE,
         "weak_health_reduce_score": WEAK_HEALTH_REDUCE_SCORE,
         "weak_health_exit_score": WEAK_HEALTH_EXIT_SCORE,
+        "sma50_extension_reduce_distance": SMA50_EXTENSION_REDUCE_DISTANCE,
+        "sma50_extension_heavy_distance": SMA50_EXTENSION_HEAVY_DISTANCE,
+        "sma50_extension_min_loss_pct": SMA50_EXTENSION_MIN_LOSS_PCT,
+        "extension_reduce_pct": EXTENSION_REDUCE_PCT,
     }
 
 
@@ -410,6 +424,16 @@ def row_formulas(row_number: int) -> Dict[str, str]:
         f'AND($J{row_number}<>"",$L{row_number}<>"",'
         f'$J{row_number}<$L{row_number},$I{row_number}<=-0.040000)'
     )
+    sma50_extension_reduce = (
+        f'AND($J{row_number}<>"",$L{row_number}<>"",$L{row_number}>0,'
+        f'$J{row_number}>=$L{row_number}*(1+{SMA50_EXTENSION_REDUCE_DISTANCE:.6f}),'
+        f'$I{row_number}<={SMA50_EXTENSION_MIN_LOSS_PCT:.6f})'
+    )
+    sma50_extension_heavy_reduce = (
+        f'AND($J{row_number}<>"",$L{row_number}<>"",$L{row_number}>0,'
+        f'$J{row_number}>=$L{row_number}*(1+{SMA50_EXTENSION_HEAVY_DISTANCE:.6f}),'
+        f'$I{row_number}<={SMA50_EXTENSION_MIN_LOSS_PCT:.6f})'
+    )
     persistent_loss_reduce = (
         f'AND($S{row_number}>={REDUCE_DAYS_RED},'
         f'$I{row_number}<={REDUCE_LOSS_PCT:.6f})'
@@ -419,10 +443,15 @@ def row_formulas(row_number: int) -> Dict[str, str]:
     )
     trend_break_reduce = f'AND($I{row_number}<0,{confirmed_sma_break})'
     reduce_signal = (
-        f'OR({heavy_loss_reduce},{atr_reduce},{sma50_break_reduce},'
+        f'OR({sma50_extension_heavy_reduce},{sma50_extension_reduce},'
+        f'{heavy_loss_reduce},{atr_reduce},{sma50_break_reduce},'
         f'{persistent_loss_reduce},{weak_health_reduce},{trend_break_reduce})'
     )
-    heavy_reduce_signal = f'OR({heavy_loss_reduce},{atr_reduce},{sma50_break_reduce})'
+    heavy_reduce_signal = (
+        f'OR({heavy_loss_reduce},{atr_reduce},{sma50_break_reduce},'
+        f'{sma50_extension_reduce})'
+    )
+    extension_reduce_signal = f'{sma50_extension_heavy_reduce}'
 
     entry_score_now = (
         f'=IFERROR(IF(OR($B{row_number}<>"long",$AA{row_number}<>"OK",NOT({applicable})),"",'
@@ -447,6 +476,8 @@ def row_formulas(row_number: int) -> Dict[str, str]:
         f'15*($S{row_number}>={EXIT_DAYS_RED})-'
         f'15*($J{row_number}<$L{row_number})-'
         f'25*($J{row_number}<$K{row_number})-'
+        f'10*AND($J{row_number}<>"",$L{row_number}<>"",$L{row_number}>0,$J{row_number}>=$L{row_number}*(1+{SMA50_EXTENSION_REDUCE_DISTANCE:.6f}))-'
+        f'20*AND($J{row_number}<>"",$L{row_number}<>"",$L{row_number}>0,$J{row_number}>=$L{row_number}*(1+{SMA50_EXTENSION_HEAVY_DISTANCE:.6f}))-'
         f'10*AND($O{row_number}<>"",$O{row_number}>0,$I{row_number}<=-{ATR_REDUCE_MULTIPLE:.6f}*$O{row_number})'
         f'))),"")'
     )
@@ -463,7 +494,8 @@ def row_formulas(row_number: int) -> Dict[str, str]:
     reduce_pct = (
         f'=IFERROR(IF($W{row_number}="EXIT",100,'
         f'IF($W{row_number}="REDUCE",'
-        f'IF({heavy_reduce_signal},{HEAVY_REDUCE_PCT},{STANDARD_REDUCE_PCT}),0)),"")'
+        f'IF({extension_reduce_signal},{EXTENSION_REDUCE_PCT},'
+        f'IF({heavy_reduce_signal},{HEAVY_REDUCE_PCT},{STANDARD_REDUCE_PCT})),0)),"")'
     )
 
     reason = (
@@ -475,13 +507,15 @@ def row_formulas(row_number: int) -> Dict[str, str]:
         f'IF({persistent_weak_exit},"Persistent weak loser: exit",'
         f'IF({failed_trend_exit},"Confirmed SMA 200 break plus weak loss: exit",'
         f'IF({broken_health_exit},"Low loss-health score after extended red period: exit",'
+        f'IF({sma50_extension_heavy_reduce},"Very extended above SMA 50 while red: large reduce",'
+        f'IF({sma50_extension_reduce},"Extended above SMA 50 while red: heavy reduce",'
         f'IF({heavy_loss_reduce},"Loss reached heavy-reduce threshold",'
         f'IF({atr_reduce},"Loss exceeds ATR risk budget: reduce",'
         f'IF({sma50_break_reduce},"SMA 50 break while red: reduce",'
         f'IF({persistent_loss_reduce},"Loss persisted past time stop: reduce",'
         f'IF({weak_health_reduce},"Weak loss-health score: reduce",'
         f'IF({trend_break_reduce},"Confirmed SMA 200 break: reduce",'
-        f'IF($V{row_number}<90,"Negative but risk still inside limits","Healthy pullback"))))))))))))))),"")'
+        f'IF($V{row_number}<90,"Negative but risk still inside limits","Healthy pullback"))))))))))))))))),"")'
     )
 
     cooldown_days = (
